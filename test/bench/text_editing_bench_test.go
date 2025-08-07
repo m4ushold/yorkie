@@ -25,81 +25,115 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
-
 	"github.com/yorkie-team/yorkie/pkg/document"
 	"github.com/yorkie-team/yorkie/pkg/document/json"
 	"github.com/yorkie-team/yorkie/pkg/document/presence"
 )
 
-func BenchmarkTextEditing(b *testing.B) {
-	b.StopTimer()
+type EditOperation struct {
+	Cursor        int
+	DelCount      int
+	InsertContent string
+}
 
-	editingTrace, err := readEditingTraceFromFile(b)
+type TraceData struct {
+	StartContent string
+	EndContent   string
+	Ops          []EditOperation
+}
+
+type rawTrace struct {
+	StartContent string `json:"startContent"`
+	EndContent   string `json:"endContent"`
+	Txns         []struct {
+		Patches [][]interface{} `json:"patches"`
+	} `json:"txns"`
+}
+
+// readEditingTraceFromFile parses a trace JSON file into a usable structure.
+func readEditingTraceFromFile(b *testing.B, path string) *TraceData {
+	file, err := os.Open(path) // #nosec G304: opening known benchmark trace file (trusted input)
+	if err != nil {
+		b.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		b.Fatal(err)
+	}
+
+	data, err := io.ReadAll(file)
 	if err != nil {
 		b.Fatal(err)
 	}
 
-	b.StartTimer()
+	var raw rawTrace
+	if err := gojson.Unmarshal(data, &raw); err != nil {
+		b.Fatal(err)
+	}
 
+	var editOps []EditOperation
+	for _, txn := range raw.Txns {
+		for _, rawPatch := range txn.Patches {
+			if len(rawPatch) != 3 {
+				b.Fatalf("invalid patch format: %v", rawPatch)
+			}
+			editOps = append(editOps, EditOperation{
+				Cursor:        int(rawPatch[0].(float64)),
+				DelCount:      int(rawPatch[1].(float64)),
+				InsertContent: rawPatch[2].(string),
+			})
+		}
+	}
+
+	return &TraceData{
+		StartContent: raw.StartContent,
+		EndContent:   raw.EndContent,
+		Ops:          editOps,
+	}
+}
+
+// replayEditingTrace performs all edit operations in order and asserts the result.
+func replayEditingTrace(b *testing.B, trace *TraceData) {
 	doc := document.New("d1")
-	err = doc.Update(func(root *json.Object, p *presence.Presence) error {
-		root.SetNewText("text")
+
+	err := doc.Update(func(root *json.Object, p *presence.Presence) error {
+		root.SetNewText("text").Edit(0, 0, trace.StartContent)
 		return nil
 	})
+	assert.NoError(b, err)
 
-	for _, edit := range editingTrace.Edits {
-		cursor := int(edit[0].(float64))
-		mode := int(edit[1].(float64))
-
-		err = doc.Update(func(root *json.Object, p *presence.Presence) error {
+	for _, op := range trace.Ops {
+		err := doc.Update(func(root *json.Object, p *presence.Presence) error {
 			text := root.GetText("text")
-			if mode == 0 {
-				value := edit[2].(string)
-				text.Edit(cursor, cursor, value)
-			} else if mode == 1 {
-				// deletion
-				text.Edit(cursor, cursor+1, "")
-			}
+			text.Edit(op.Cursor, op.Cursor+op.DelCount, op.InsertContent)
 			return nil
 		})
 		assert.NoError(b, err)
 	}
-	b.StopTimer()
 
-	assert.Equal(
-		b,
-		editingTrace.FinalText,
-		doc.Root().GetText("text").String(),
-	)
+	finalContent := doc.Root().GetText("text").String()
+	assert.Equal(b, trace.EndContent, finalContent)
 }
 
-type editTrace struct {
-	Edits     [][]interface{} `json:"edits"`
-	FinalText string          `json:"finalText"`
-}
-
-// readEditingTraceFromFile reads trace from editing-trace.json.
-func readEditingTraceFromFile(b *testing.B) (*editTrace, error) {
-	var trace editTrace
-
-	file, err := os.Open("./editing-trace.json")
-	if err != nil {
-		return nil, err
-	}
-	defer func() {
-		if err = file.Close(); err != nil {
-			b.Fatal(err)
-		}
-	}()
-
-	byteValue, err := io.ReadAll(file)
-	if err != nil {
-		return nil, err
+// BenchmarkTextEditing benchmarks all trace files sequentially.
+func BenchmarkTextEditing(b *testing.B) {
+	traceFiles := []string{
+		"automerge-paper.json",
+		"clownschool_flat.json",
+		"friendsforever_flat.json",
+		"json-crdt-blog-post.json",
+		"json-crdt-patch.json",
+		"rustcode.json",
+		"seph-blog1.json",
+		"sveltecomponent.json",
 	}
 
-	if err = gojson.Unmarshal(byteValue, &trace); err != nil {
-		return nil, err
+	for _, file := range traceFiles {
+		b.Run(file, func(b *testing.B) {
+			trace := readEditingTraceFromFile(b, "editing-traces/"+file)
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				replayEditingTrace(b, trace)
+			}
+		})
 	}
-
-	return &trace, err
 }
